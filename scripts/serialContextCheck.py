@@ -50,7 +50,7 @@ def get_belief(prev_word, prev_belief):
 # but only words that are suggested as possible corrections within an edit distance of MAX_EDIT_DISTANCE.
 def viterbi(words, dictionary, longest_word_length, max_edit_distance, not_found_str, \
 			start_prob, default_start_prob, transition_prob, default_transition_prob, \
-                num_word_suggestions=5000):
+                min_count=1, num_word_suggestions=5000):
     
     V = [{}]
     path = {}
@@ -63,7 +63,7 @@ def viterbi(words, dictionary, longest_word_length, max_edit_distance, not_found
         
     # Character level correction
     corrections = swc.get_suggestions(words[0], dictionary, longest_word_length, max_edit_distance, \
-                                  silent=True, min_count=1)
+                                  silent=True, min_count=min_count)
 
     # To ensure Viterbi can keep running
     if len(corrections) == 0:
@@ -102,7 +102,7 @@ def viterbi(words, dictionary, longest_word_length, max_edit_distance, not_found
         
         # Character level correction
         corrections = swc.get_suggestions(words[t], dictionary, longest_word_length, max_edit_distance, \
-                        silent=True, min_count=1)
+                        silent=True, min_count=min_count)
         
         # To ensure Viterbi can keep running
         if len(corrections) == 0:
@@ -145,7 +145,7 @@ def viterbi(words, dictionary, longest_word_length, max_edit_distance, not_found
 
 def correct_document_context(fname, dictionary, longest_word_length, max_edit_distance, not_found_str, \
 							start_prob, default_start_prob, transition_prob, default_transition_prob, \
-                            num_word_suggestions=5000):
+                            min_count=1, num_word_suggestions=5000):
     
     doc_word_count = 0
     unknown_word_count = 0
@@ -166,7 +166,7 @@ def correct_document_context(fname, dictionary, longest_word_length, max_edit_di
                 if len(words) > 0:
                 
                     suggestion_w, suggestion_c = viterbi(words, dictionary, longest_word_length, max_edit_distance, not_found_str, \
-                                                start_prob, default_start_prob, transition_prob, default_transition_prob)
+                                                start_prob, default_start_prob, transition_prob, default_transition_prob, min_count=min_count)
 
                     # Display sentences where errors have been identified
                     if (words != suggestion_w) or (words != suggestion_c):

@@ -14,10 +14,11 @@ import serialContextCheck as scc
 
 if __name__ == '__main__':
 
+	MIN_COUNT = 1
 	MAX_EDIT_DISTANCE = 3
 	NOT_FOUND_STR = '<not found>'
 
-	print 'SERIAL WORD-LEVEL CHECKING...'
+	print '\nSERIAL WORD-LEVEL CHECKING...'
 
 	start_time = time.time()
 
@@ -36,7 +37,7 @@ if __name__ == '__main__':
 
    	print '\nRuntime: %.2f seconds' % run_time
 
-	print 'SERIAL CONTEXT-LEVEL CHECKING...'
+	print '\nSERIAL CONTEXT-LEVEL CHECKING...'
 
 	start_time = time.time()
 
@@ -49,11 +50,8 @@ if __name__ == '__main__':
 
 	start_time = time.time()
 
-	scc.correct_document_context("testdata/test.txt", \
-	                         dictionary, longest_word_length, \
-	                         MAX_EDIT_DISTANCE, NOT_FOUND_STR, \
-	                         start_prob, default_start_prob, \
-	                         transition_prob, default_transition_prob)
+	scc.correct_document_context("testdata/test.txt", dictionary, longest_word_length, MAX_EDIT_DISTANCE, NOT_FOUND_STR, \
+	                         start_prob, default_start_prob, transition_prob, default_transition_prob, min_count=MIN_COUNT)
 
 	run_time = time.time() - start_time
 
