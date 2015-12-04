@@ -1,4 +1,11 @@
-# contextSerial.py
+# contextSerial.py - Serial implementation
+
+import re
+import math
+from scipy.stats import poisson
+import time
+import sys, getopt
+import os
 
 ######################
 #
@@ -22,7 +29,7 @@
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 30 Nov 2015
+# v 1.0 last revised 3 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition
@@ -44,7 +51,7 @@
 # defined minimum values are used for words that are not present in
 # the dictionary and/or probability tables.
 #
-# More detail is included below.
+# More detail on the specific implementation is included below.
 #
 ######################
 
@@ -92,23 +99,14 @@
 #
 ######################
 
-import re
-import math
-from scipy.stats import poisson
-import time
-import sys, getopt
-import os
-
-MAX_EDIT_DISTANCE = 3
-
-def get_deletes_list(w):
+def get_deletes_list(w, max_edit_distance):
     '''
-    Given a word, derive strings with up to MAX_EDIT_DISTANCE
+    Given a word, derive strings with up to max_edit_distance
     characters deleted.
     '''
     deletes = []
     queue = [w]
-    for d in range(MAX_EDIT_DISTANCE):
+    for d in range(max_edit_distance):
         temp_queue = []
         for word in queue:
             if len(word)>1:
@@ -122,7 +120,7 @@ def get_deletes_list(w):
         
     return deletes
 
-def create_dictionary_entry(w, dictionary):
+def create_dictionary_entry(w, dictionary, max_edit_distance):
     '''
     Add a word and its derived deletions to the dictionary.
     Dictionary entries are of the form:
@@ -147,7 +145,7 @@ def create_dictionary_entry(w, dictionary):
         # word counter frequency is not incremented in those cases
         
         new_real_word_added = True
-        deletes = get_deletes_list(w)
+        deletes = get_deletes_list(w, max_edit_distance)
         
         for item in deletes:
             if item in dictionary:
@@ -161,7 +159,7 @@ def create_dictionary_entry(w, dictionary):
         
     return new_real_word_added
 
-def pre_processing(fname):
+def pre_processing(fname, max_edit_distance=3):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
@@ -186,8 +184,9 @@ def pre_processing(fname):
                 for w, word in enumerate(words):
                     
                     # create/update dictionary entry
-                    if create_dictionary_entry(word, dictionary):
-                        word_count += 1
+                    if create_dictionary_entry(
+                        word, dictionary, max_edit_distance):
+                            word_count += 1
                         
                     # update probabilities for Hidden Markov Model
                     if w == 0:
@@ -244,7 +243,7 @@ def pre_processing(fname):
     print 'Total unique words in corpus: %i' % word_count
     print 'Total items in dictionary: %i' \
         % len(dictionary)
-    print '  Edit distance for deletions: %i' % MAX_EDIT_DISTANCE
+    print '  Edit distance for deletions: %i' % max_edit_distance
     print 'Total unique words at the start of a sentence: %i' \
         % len(start_prob)
     print 'Total unique word transitions: %i' % len(transition_prob)
@@ -421,8 +420,8 @@ def dameraulevenshtein(seq1, seq2):
                 
     return thisrow[len(seq2) - 1]
 
-def get_suggestions(string, dictionary, longest_word_length=20, 
-                    min_count=100, max_sug=10):
+def get_suggestions(string, dictionary, max_edit_distance, 
+                    longest_word_length=20, min_count=100, max_sug=10):
     '''
     Return list of suggested corrections for potentially incorrectly
     spelled word.
@@ -436,7 +435,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
     from word being checked)
     '''
     
-    if (len(string) - longest_word_length) > MAX_EDIT_DISTANCE:
+    if (len(string) - longest_word_length) > max_edit_distance:
         # to ensure Viterbi can keep running -- use the word itself
         return [(string, 0)]
     
@@ -488,7 +487,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
                     # Levenshtein distance
                     item_dist = dameraulevenshtein(sc_item, string)
                     
-                    if item_dist<=MAX_EDIT_DISTANCE:
+                    if item_dist<=max_edit_distance:
                         # should already be in dictionary if in
                         # suggestion list
                         assert sc_item in dictionary  
@@ -501,7 +500,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
         # delete) from the queue item as additional items to check
         # -- add to end of queue
         assert len(string)>=len(q_item)
-        if (len(string)-len(q_item))<MAX_EDIT_DISTANCE \
+        if (len(string)-len(q_item))<max_edit_distance \
             and len(q_item)>1:
             for c in range(len(q_item)): # character index        
                 word_minus_c = q_item[:c] + q_item[c+1:]
@@ -588,7 +587,7 @@ def get_path_prob(prev_word, prev_path_prob):
         return math.log(math.exp(min(prev_path_prob.values()))/2.)  
     
 def viterbi(words, dictionary, start_prob, default_start_prob, 
-            transition_prob, default_transition_prob):
+            transition_prob, default_transition_prob, max_edit_distance):
     '''
     Determines the most likely (intended) sequence, based on the
     observed sequence. Full details in preamble above.
@@ -599,7 +598,7 @@ def viterbi(words, dictionary, start_prob, default_start_prob,
     path_context = []
     
     # character level correction - used to determine state space
-    corrections = get_suggestions(words[0], dictionary)
+    corrections = get_suggestions(words[0], dictionary, max_edit_distance)
         
     # Initialize base cases (first word in the sentence)
     for sug_word in corrections:
@@ -633,7 +632,7 @@ def viterbi(words, dictionary, start_prob, default_start_prob,
         new_path = {}
         
         # character level correction
-        corrections = get_suggestions(words[t], dictionary)
+        corrections = get_suggestions(words[t], dictionary, max_edit_distance)
  
         for sug_word in corrections:
         
@@ -678,7 +677,7 @@ def viterbi(words, dictionary, start_prob, default_start_prob,
 def correct_document_context(fname, dictionary, 
                              start_prob, default_start_prob,
                              transition_prob, default_transition_prob,
-                             display_results=False):
+                             max_edit_distance=3, display_results=False):
     
     doc_word_count = 0
     corrected_word_count = 0
@@ -702,7 +701,8 @@ def correct_document_context(fname, dictionary,
                     # as the original sentence)
                     suggestion = viterbi(words, dictionary,
                                 start_prob, default_start_prob, 
-                                transition_prob, default_transition_prob)
+                                transition_prob, default_transition_prob,
+                                max_edit_distance)
 
                     # display sentences with suggested changes
                     if words != suggestion:
@@ -822,9 +822,9 @@ if __name__ == '__main__':
     #
     ############
 
-    start_time = time.time()
-
     print 'Spell-checking %s...' % check_file
+
+    start_time = time.time()
 
     correct_document_context(check_file, dictionary,
                              start_prob, default_start_prob, 

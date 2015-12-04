@@ -1,8 +1,11 @@
+# contextSPARK2.py - SPARK implementation, approximate parallelization
+
 import re
 import math
 from scipy.stats import poisson
-import itertools
 import time
+import sys, getopt
+import os
 
 # Initialize Spark
 from pyspark import SparkContext
@@ -11,24 +14,108 @@ sc.setLogLevel('ERROR')
 
 ######################
 #
-# DOCUMENTATION HERE
+# Submission by Gioia Dominedo (Harvard ID: 40966234) for
+# CS 205 - Computing Foundations for Computational Science
+# 
+# This is part of a joint project with Kendrick Lo that includes a
+# separate component for word-level checking. This script includes 
+# one of three SPARK implementations for context-level spell-checking
+# adapted from third party algorithms (Symspell and Viterbi algorithms). 
+#
+# The following were also used as references:
+# Peter Norvig, How to Write a Spelling Corrector
+#   (http://norvig.com/spell-correct.html)
+# Peter Norvig, Natural Language Corpus Data: Beautiful Data
+#   (http://norvig.com/ngrams/ch14.pdf)
 #
 ######################
 
-# number of partitions to be used
-n_partitions = 6
-MAX_EDIT_DISTANCE = 3
+######################
+#
+# SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
+#
+# v 1.0 last revised 3 Dec 2015
+#
+# Each sentence is modeled as a hidden Markov model. Prior
+# probabilities (for first words in the sentences) and transition
+# probabilities (for all subsequent words) are calculated when
+# generating the main dictionary, using the same corpus. Emission
+# probabilities are generated on the fly by parameterizing a Poisson 
+# distribution with the edit distance between words and suggested
+# corrections.
+#
+# The state space of possible corrections for each word is generated
+# using logic based on the Symspell spell-checker (see below for more
+# detail on Symspell). Valid suggestions must: (a) be 'real' words;
+# (b) appear at least 100 times in the corpus used to generate the
+# dictionary; (c) be one of the top 10 suggestions, based on frequency
+# and edit distance. This simplification ensures that the state space
+# remains manageable.
+#
+# All probabilities are stored in log-space to avoid underflow. Pre-
+# defined minimum values are used for words that are not present in
+# the dictionary and/or probability tables.
+#
+# More detail on the specific implementation is included below.
+#
+######################
 
-def get_n_deletes_list(w, n):
+######################
+#
+# PRE-PROCESSING STEPS
+#
+# The pre-processing steps have been adapted from the dictionary
+# creation of the word-level spellchecker, which in turn was based on
+# SymSpell, a Symmetric Delete spelling correction algorithm
+# developed by Wolf Garbe and originally written in C#. More detail
+# on SymSpell is included in the word-level spellcheck documentation.
+#
+# The main modifications to the word-level spellchecker pre-
+# processing stages are to create the additional outputs that are
+# required for the context-level checking, and to eliminate redundant
+# outputs that are not necessary.
+#
+# The outputs of the pre-processing stage are:
+#
+# - dictionary: A dictionary that combines both words present in the
+# corpus and other words that are within a given 'delete distance'. 
+# The format of the dictionary is:
+# {word: ([list of words within the given 'delete distance'], 
+# word count in corpus)}
+#
+# - start_prob: A dictionary with key, value pairs that correspond to
+# (word, probability of the word being the first word in a sentence)
+#
+# - transition_prob: A dictionary of dictionaries that stores the
+# probability of a given word following another. The format of the
+# dictionary is:
+# {previous word: {word1 : P(word1|prevous word), word2 : 
+# P(word2|prevous word), ...}}
+#
+# - default_start_prob: A benchmark probability of a word being at
+# the start of a sentence, set to 1 / # of words at the beginning of
+# sentences. This ensures that all previously unseen words at the
+# beginning of sentences are not corrected unnecessarily.
+#
+# - default_transition_prob: A benchmark probability of a word being
+# seen, given the previous word in the sentence, also set to 1 / # of
+# transitions in corpus. This ensures that all previously unseen
+# transitions are not corrected unnecessarily.
+#
+######################
+
+def get_deletes_list(w, max_edit_distance):
     '''
-    Given a word, derive list of strings with up to n characters deleted
+    Given a word, derive strings with up to max_edit_distance
+    characters deleted. 
+
+    The list is generally of the same magnitude as the number of
+    characters in a word, so it does not make sense to parallelize
+    this function. Instead, we use Python to create the list.
     '''
-    # since this list is generally of the same magnitude as the number of 
-    # characters in a word, it may not make sense to parallelize this
-    # so we use python to create the list
     deletes = []
     queue = [w]
-    for d in range(n):
+    for d in range(max_edit_distance):
         temp_queue = []
         for word in queue:
             if len(word)>1:
@@ -43,27 +130,30 @@ def get_n_deletes_list(w, n):
     return deletes
 
 def get_transitions(sentence):
+    '''
+    Helper function: converts a sentence into all two-word pairs.
+    Output format is a list of tuples.
+    e.g. 'This is a test' >> ('this', 'is'), ('is', 'a'), ('a', 'test')
+    ''' 
     if len(sentence)<2:
         return None
     else:
         return [((sentence[i], sentence[i+1]), 1) 
                 for i in range(len(sentence)-1)]
     
-def map_transition_prob(x):
-    vals = x[1]
+def map_transition_prob(vals):
+    '''
+    Helper function: calculates conditional probabilities for all word
+    pairs, i.e. P(word|previous word)
+    '''
     total = float(sum(vals.values()))
-    probs = {k: math.log(v/total) for k, v in vals.items()}
-    return (x[0], probs)
+    return {k: math.log(v/total) for k, v in vals.items()}
 
-def parallel_create_dictionary(fname):
+def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
     '''
-    Create dictionary, start probabilities and transition
-    probabilities using Spark RDDs.
+    Load a text file and use it to create a dictionary and
+    to calculate start probabilities and transition probabilities. 
     '''
-    # we generate and count all words for the corpus,
-    # then add deletes to the dictionary
-    # this is a slightly different approach from the SymSpell algorithm
-    # that may be more appropriate for Spark processing
     
     ############
     #
@@ -74,12 +164,16 @@ def parallel_create_dictionary(fname):
     # http://stackoverflow.com/questions/22520932/python-remove-all-non-alphabet-chars-from-string
     regex = re.compile('[^a-z ]')
 
-    # convert file into one long sequence of words
+    # load file contents and convert into one long sequence of words
+    # RDD format: 'line 1', 'line 2', 'line 3', ...
+    # cache because this is used in multiple operations 
     make_all_lower = sc.textFile(fname) \
             .map(lambda line: line.lower()) \
             .filter(lambda x: x!='').cache()
     
     # split into individual sentences and remove other punctuation
+    # RDD format: [words of sentence 1], [words of sentence 2], ...
+    # cache because this is used in multiple operations 
     split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
             .map(lambda sentence: regex.sub(' ', sentence)) \
             .map(lambda sentence: sentence.split()).cache()
@@ -90,28 +184,41 @@ def parallel_create_dictionary(fname):
     #
     ############
     
-    # only focus on words at the start of sentences
-    start_words = split_sentence.map(lambda sentence: sentence[0] if len(sentence)>0 else None) \
+    # extract all words that are at the beginning of sentences
+    # RDD format: 'word1', 'word2', 'word3', ...
+    start_words = split_sentence.map(lambda sentence: sentence[0] 
+        if len(sentence)>0 else None) \
             .filter(lambda word: word!=None)
     
     # add a count to each word
-    count_start_words_once = start_words.map(lambda word: (word, 1)).cache()
+    # RDD format: ('word1', 1), ('word2', 1), ('word3', 1), ...
+    # note: partition here because we are using words as keys for the first
+    # time (yields a small but consistent improvement in runtime ~2-3 sec)
+    # cache because this is used in multiple operations
+    count_start_words_once = start_words.map(lambda word: (word, 1)) \
+            .partitionBy(num_partitions).cache()
 
-    # use accumulator to count the number of words at the start of sentences
+    # use accumulator to count the number of start words processed
     accum_total_start_words = sc.accumulator(0)
-    count_total_start_words = count_start_words_once.foreach(lambda x: accum_total_start_words.add(1))
+    count_start_words_once.foreach(lambda x: accum_total_start_words.add(1))
     total_start_words = float(accum_total_start_words.value)
     
     # reduce into count of unique words at the start of sentences
+    # RDD format: ('word1', frequency), ('word2', frequency), ...
     unique_start_words = count_start_words_once.reduceByKey(lambda a, b: a + b)
     
-    # convert counts to probabilities
-    start_prob_calc = unique_start_words.mapValues(lambda v: math.log(v/total_start_words))
+    # convert counts to log-probabilities
+    # RDD format: ('word1', log-prob of word1), 
+    #             ('word2', log-prob of word2), ...
+    start_prob_calc = unique_start_words.mapValues(lambda v: 
+        math.log(v/total_start_words))
     
     # get default start probabilities (for words not in corpus)
     default_start_prob = math.log(1/total_start_words)
     
-    # store start probabilities as a dictionary (will be used as a lookup table)
+    # store start probabilities as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
     start_prob = start_prob_calc.collectAsMap()
     
     ############
@@ -120,96 +227,136 @@ def parallel_create_dictionary(fname):
     #
     ############
     
+    # note: various partitioning strategies were attempted for this
+    # portion of the function, but they failed to yield significant
+    # improvements in performance.
+
     # focus on continuous word pairs within the sentence
     # e.g. "this is a test" -> "this is", "is a", "a test"
     # note: as the relevant probability is P(word|previous word)
     # the tuples are ordered as (previous word, word)
-    other_words = split_sentence.map(lambda sentence: get_transitions(sentence)) \
-            .filter(lambda x: x!=None). \
-            flatMap(lambda x: x).cache()
 
-    # use accumulator to count the number of transitions
+    # extract all word pairs within a sentence and add a count
+    # RDD format: (('word1', 'word2'), 1), (('word2', 'word3'), 1), ...
+    # cache because this is used in multiple operations 
+    other_words = split_sentence.map(lambda sentence: 
+        get_transitions(sentence)) \
+            .filter(lambda x: x!=None) \
+            .flatMap(lambda x: x).cache()
+
+    # use accumulator to count the number of transitions (word pairs)
     accum_total_other_words = sc.accumulator(0)
-    count_total_other_words = other_words.foreach(lambda x: accum_total_other_words.add(1))
+    other_words.foreach(lambda x: accum_total_other_words.add(1))
     total_other_words = float(accum_total_other_words.value)
     
     # reduce into count of unique word pairs
+    # RDD format: (('word1', 'word2'), frequency), 
+    #             (('word2', 'word3'), frequency), ...
     unique_other_words = other_words.reduceByKey(lambda a, b: a + b)
     
-    # aggregate by previous word
-    # i.e. (previous word, [(word1, word1-previous word count), (word2, word2-previous word count), ...])
-    other_words_collapsed = unique_other_words.map(lambda x: (x[0][0], (x[0][1], x[1]))) \
+    # aggregate by (and change key to) previous word
+    # RDD format: ('previous word', {'word1': word pair count, 
+    #                                'word2': word pair count}}), ...
+    other_words_collapsed = unique_other_words.map(lambda x: 
+        (x[0][0], (x[0][1], x[1]))) \
             .groupByKey().mapValues(dict)
 
-    # POTENTIAL OPTIMIZATION: FIND AN ALTERNATIVE TO GROUPBYKEY (CREATES ~9.3MB SHUFFLE)
+    # note: the above line of code is the slowest in the function
+    # (8.6 MB shuffle read and 4.5 MB shuffle write for big.txt)
+    # An alternative approach that aggregates lists with reduceByKey was
+    # attempted, but did not yield noticeable improvements in runtime.
     
-    # convert counts to probabilities
-    transition_prob_calc = other_words_collapsed.map(lambda x: map_transition_prob(x))
-    
+    # convert counts to log-probabilities
+    # RDD format: ('previous word', {'word1': log-prob of pair, 
+    #                                 word2: log-prob of pair}}), ...
+    transition_prob_calc = other_words_collapsed.mapValues(lambda v: 
+        map_transition_prob(v))
+
     # get default transition probabilities (for word pairs not in corpus)
     default_transition_prob = math.log(1/total_other_words)
     
-    # store transition probabilities as dictionary (will be used as lookup table)
+    # store transition probabilities as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
     transition_prob = transition_prob_calc.collectAsMap()
     
     ############
     #
-    # process corpus for dictionary
+    # generate dictionary
     #
     ############
-    
-    replace_nonalphs = make_all_lower.map(lambda line: regex.sub(' ', line))
-    all_words = replace_nonalphs.flatMap(lambda line: line.split())
 
-    # create core corpus dictionary (i.e. only words appearing in file, no "deletes") and cache it
-    # output RDD of unique_words_with_count: [(word1, count1), (word2, count2), (word3, count3)...]
+    # note: this approach is slightly different from the original SymSpell
+    # algorithm, but is more appropriate for a SPARK implementation
+    
+    # split into individual words (all)
+    # RDD format: 'word1', 'word2', 'word3', ...
+    # cache because this is used in multiple operations 
+    all_words = make_all_lower.map(lambda line: regex.sub(' ', line)) \
+            .flatMap(lambda line: line.split()).cache()
+
+    # use accumulator to count the number of words processed
+    accum_words_processed = sc.accumulator(0)
+    all_words.foreach(lambda x: accum_words_processed.add(1))
+
+    # add a count to each word
+    # RDD format: ('word1', 1), ('word2', 1), ('word3', 1), ...
     count_once = all_words.map(lambda word: (word, 1))
-    unique_words_with_count = count_once.reduceByKey(lambda a, b: a + b).cache()
-    
-    ############
-    #
-    # generate deletes list
-    #
-    ############
-    
-    # generate list of n-deletes from words in a corpus of the form: [(word1, count1), (word2, count2), ...]
-     
-    assert MAX_EDIT_DISTANCE > 0  
-    
-    generate_deletes = unique_words_with_count.map(lambda (parent, count): 
-                                                   (parent, get_n_deletes_list(parent, MAX_EDIT_DISTANCE)))
-    expand_deletes = generate_deletes.flatMapValues(lambda x: x)
-    swap = expand_deletes.map(lambda (orig, delete): (delete, ([orig], 0)))
-   
-    ############
-    #
-    # combine delete elements with main dictionary
-    #
-    ############
-    
-    corpus = unique_words_with_count.mapValues(lambda count: ([], count))
-    combine = swap.union(corpus)  # combine deletes with main dictionary, eliminate duplicates
-    
-    # since the dictionary will only be a lookup table once created, we can
-    # pass on as a Python dictionary rather than RDD by reducing locally and
-    # avoiding an extra shuffle from reduceByKey
-    dictionary = combine.reduceByKeyLocally(lambda a, b: (a[0]+b[0], a[1]+b[1]))
 
-    words_processed = unique_words_with_count.map(lambda (k, v): v) \
-            .reduce(lambda a, b: a + b)
-        
-    word_count = unique_words_with_count.count()   
+    # reduce into counts of unique words - this is the core corpus dictionary
+    # (i.e. only words appearing in the file, without 'deletes'))
+    # RDD format: ('word1', frequency), ('word2', frequency), ...
+    # cache because this is used in multiple operations 
+    # note: imposing partitioning at this step yields a small ~0.5-1 sec
+    # improvement in runtime by equally balancing elements among workers
+    # for subsequent operations
+    unique_words_with_count = count_once.reduceByKey(lambda a, b: a + b, 
+        numPartitions = num_partitions).cache()
+    
+    # use accumulator to count the number of unique words
+    accum_unique_words = sc.accumulator(0)
+    unique_words_with_count.foreach(lambda x: accum_unique_words.add(1))
+
+    # generate list of "deletes" for each word in the corpus
+    # RDD format: (word1, [deletes for word1]), (word2, [deletes for word2]), ...
+    generate_deletes = unique_words_with_count.map(lambda (parent, count): 
+        (parent, get_deletes_list(parent, max_edit_distance)))
+    
+    # split into all key-value pairs
+    # RDD format: (word1, delete1), (word1, delete2), ...
+    expand_deletes = generate_deletes.flatMapValues(lambda x: x)
+    
+    # swap word order and add a zero count (because "deletes" were not
+    # present in the dictionary)
+    swap = expand_deletes.map(lambda (orig, delete): (delete, ([orig], 0)))
+    
+    # create a placeholder for each real word
+    # RDD format: ('word1', ([], frequency)), ('word2', ([], frequency)), ...
+    corpus = unique_words_with_count.mapValues(lambda count: ([], count))
+
+    # combine main dictionary and "deletes" (and eliminate duplicates)
+    # RDD format: ('word1', ([deletes for word1], frequency)), 
+    #             ('word2', ([deletes for word2], frequency)), ...
+    combine = swap.union(corpus)
+    
+    # store dictionary items and deletes as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
+    # note: use reduceByKeyLocally to avoid an extra shuffle from reduceByKey
+    dictionary = combine.reduceByKeyLocally(lambda a, b: (a[0]+b[0], a[1]+b[1])) 
     
     # output stats
-    print 'Total words processed: %i' % words_processed
-    print 'Total unique words in corpus: %i' % word_count 
-    print 'Total items in dictionary (corpus words and deletions): %i' % len(dictionary)
-    print '  Edit distance for deletions: %i' % MAX_EDIT_DISTANCE
+    print 'Total words processed: %i' % accum_words_processed.value
+    print 'Total unique words in corpus: %i' % accum_unique_words.value 
+    print 'Total items in dictionary (corpus words and deletions): %i' \
+        % len(dictionary)
+    print '  Edit distance for deletions: %i' % max_edit_distance
     print 'Total unique words at the start of a sentence: %i' \
         % len(start_prob)
     print 'Total unique word transitions: %i' % len(transition_prob)
     
-    return dictionary, start_prob, default_start_prob, transition_prob, default_transition_prob
+    return dictionary, start_prob, default_start_prob, \
+            transition_prob, default_transition_prob
 
 ######################
 #
