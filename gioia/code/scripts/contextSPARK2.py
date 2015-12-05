@@ -6,6 +6,7 @@ from scipy.stats import poisson
 import time
 import sys, getopt
 import os
+import itertools
 
 # Initialize Spark
 from pyspark import SparkContext
@@ -34,7 +35,7 @@ sc.setLogLevel('ERROR')
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 3 Dec 2015
+# v 1.0 last revised 5 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition
@@ -56,7 +57,52 @@ sc.setLogLevel('ERROR')
 # defined minimum values are used for words that are not present in
 # the dictionary and/or probability tables.
 #
+# The pre-processing steps are the same across all three SPARK
+# implementations.
+#
 # More detail on the specific implementation is included below.
+#
+######################
+
+######################
+#
+# SPARK IMPLEMENTATION DETAILS - APPROXIMATE PARALLELIZATION
+#
+# This is the second attempt at parallelizing the Viterbi algorithm.
+#
+# This implementation is inspired by the algorithm, but is not completely
+# faithful to it. 
+#
+# For a given sentence, the Viterbi algorithm steps through each word
+# in turn. At each iteration, it assesses the combination of all
+# previous paths and the word currently under consideration, and only
+# stores the previous path with the highest probability. Consequently,
+# only a subset of the possible combinations of words are retained
+# by the last step.
+#
+# In contrast, this implementation considers all the possible
+# sentences that could be created through combinations of all possible
+# corrections for all the words in a sentence.
+# e.g. "This is a test" -> if each word has 5 possible corrections,
+# then there are 5^4 possible resulting sentences.
+# We calculate the probability of each sentence (using the same concepts
+# of start probabilities, emission probabilities, and transition
+# probabilities) and choose the sentence (word combination) with the
+# highest probability.
+#
+# There are several problems with this implementation.
+# 
+# First, as expected, this approach yields similar corrections to the
+# Viterbi algorithm in many cases, but not always. Despite not being
+# a compeletely faithful representation of the original algorithm,
+# this implementation was considered a way to experiement with a 
+# different way of parallelixing the problem.
+#
+# The second problem is more severe. Under this implementation, the
+# size of the problem grows exponentially with the size of the text
+# being checked (e.g. an 8-word sentence results in 10^8 possible
+# combinations). This not only makes the approach inefficient, but
+# (more importantly) means that it does not scale to larger problems.
 #
 ######################
 
@@ -149,12 +195,18 @@ def map_transition_prob(vals):
     total = float(sum(vals.values()))
     return {k: math.log(v/total) for k, v in vals.items()}
 
-def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
+def parallel_create_dictionary(fname, max_edit_distance=3, 
+                                num_partitions=6):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
     '''
     
+    # Note: this function makes use of multiple accumulators to keep
+    # track of the words that are being processed. An alternative 
+    # implementation that wraps accumulators in helper functions was
+    # also tested, but did not yield any noticeable improvements.
+
     ############
     #
     # load file & initial processing
@@ -166,17 +218,19 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
 
     # load file contents and convert into one long sequence of words
     # RDD format: 'line 1', 'line 2', 'line 3', ...
-    # cache because this is used in multiple operations 
+    # cache because this RDD is used in multiple operations 
     make_all_lower = sc.textFile(fname) \
             .map(lambda line: line.lower()) \
             .filter(lambda x: x!='').cache()
     
     # split into individual sentences and remove other punctuation
     # RDD format: [words of sentence 1], [words of sentence 2], ...
-    # cache because this is used in multiple operations 
-    split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
-            .map(lambda sentence: regex.sub(' ', sentence)) \
-            .map(lambda sentence: sentence.split()).cache()
+    # cache because this RDD is used in multiple operations 
+    split_sentence = make_all_lower.flatMap(lambda 
+        line: line.replace('?','.').replace('!','.').split('.')) \
+             .map(lambda sentence: regex.sub(' ', sentence)) \
+             .map(lambda sentence: sentence.split()) \
+             .filter(lambda x: x!=[]).cache()
     
     ############
     #
@@ -192,9 +246,10 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
     
     # add a count to each word
     # RDD format: ('word1', 1), ('word2', 1), ('word3', 1), ...
-    # note: partition here because we are using words as keys for the first
-    # time (yields a small but consistent improvement in runtime ~2-3 sec)
-    # cache because this is used in multiple operations
+    # note: partition here because we are using words as keys for
+    # the first time - yields a small but consistent improvement in
+    # runtime (~2-3 sec for big.txt)
+    # cache because this RDD is used in multiple operations
     count_start_words_once = start_words.map(lambda word: (word, 1)) \
             .partitionBy(num_partitions).cache()
 
@@ -238,7 +293,7 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
 
     # extract all word pairs within a sentence and add a count
     # RDD format: (('word1', 'word2'), 1), (('word2', 'word3'), 1), ...
-    # cache because this is used in multiple operations 
+    # cache because this RDD is used in multiple operations 
     other_words = split_sentence.map(lambda sentence: 
         get_transitions(sentence)) \
             .filter(lambda x: x!=None) \
@@ -291,7 +346,7 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
     
     # split into individual words (all)
     # RDD format: 'word1', 'word2', 'word3', ...
-    # cache because this is used in multiple operations 
+    # cache because this RDD is used in multiple operations 
     all_words = make_all_lower.map(lambda line: regex.sub(' ', line)) \
             .flatMap(lambda line: line.split()).cache()
 
@@ -306,10 +361,10 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
     # reduce into counts of unique words - this is the core corpus dictionary
     # (i.e. only words appearing in the file, without 'deletes'))
     # RDD format: ('word1', frequency), ('word2', frequency), ...
-    # cache because this is used in multiple operations 
-    # note: imposing partitioning at this step yields a small ~0.5-1 sec
-    # improvement in runtime by equally balancing elements among workers
-    # for subsequent operations
+    # cache because this RDD is used in multiple operations 
+    # note: imposing partitioning at this step yields a small 
+    # improvement in runtime (~1 sec for big.txt) by equally
+    # balancing elements among workers for subsequent operations
     unique_words_with_count = count_once.reduceByKey(lambda a, b: a + b, 
         numPartitions = num_partitions).cache()
     
@@ -360,29 +415,104 @@ def parallel_create_dictionary(fname, max_edit_distance=3, num_partitions=6):
 
 ######################
 #
-# DOCUMENTATION HERE
+# SPELL-CHECKING - (APPROXIMATE) VITERBI ALGORITHM
+#
+# The below functions are used to read in a text file, break it down
+# into individual sentences, and then carry out context-based spell-
+# checking on each sentence in turn. In cases where the 'suggested'
+# word does not match the actual word in the text, both the original
+# and the suggested sentences are printed/outputed to file.
+#
+# Probabilistic model:
+#
+# Each sentence is modeled as a hidden Markov model, where the
+# hidden states are the words that the user intended to type, and
+# the emissions are the words that were actually typed.
+#
+# For each word in a sentence, we can define:
+#
+# - emission probabilities: P(observed word|intended word)
+#
+# - prior probabilities (for first words in sentences only):
+# P(being the first word in a sentence)
+#
+# - transition probabilities (for all subsequent words):
+# P(intended word|previous intended word)
+#
+# Prior and transition probabilities were calculated in the pre-
+# processing steps above, using the same corpus as the dictionary.
+# 
+# Emission probabilities are calculated on the fly using a Poisson
+# distribution as follows:
+# P(observed word|intended word) = PMF of Poisson(k, l), where
+# k = edit distance between word typed and word intended, and l=0.01.
+# Both the overall approach and the parameter of l=0.01 are based on
+# the 2015 lecture notes from AM207 Stochastic Optimization.
+# Various parameters for lambda between 0 and 1 were tested, which
+# confirmed that 0.01 yields the most accurate word suggestions.
+#
+# All probabilities are stored in log-space to avoid underflow. Pre-
+# defined minimum values (also defined at the pre-processing stage)
+# are used for words that are not present in the dictionary and/or
+# probability tables.
+#
+# Algorithm:
+#
+# The spell-checking itself is carried out using a modified version
+# of the Viterbi algorithm, which yields the most likely sequence of
+# hidden states, i.e. the most likely sequence of words that form a
+# sentence. As with the other implementations, the state space (i.e.
+# list of possible corrections) is generated (and therefore varies)
+# for each word. This is in contrast to the alternative of considering
+# the state space of all possible words in the dictionary for every
+# word that is checked, which would be intractable for larger
+# dictionaries.
+#
+# This version also uses a further approximation to the original
+# algorithm.
+#
+# For a given sentence, the Viterbi algorithm steps through each word
+# in turn. At each iteration, it assesses the combination of all
+# previous paths and the word currently under consideration, and only
+# stores the previous path with the highest probability. Consequently,
+# only a subset of the possible combinations of words are retained
+# by the last step.
+#
+# In contrast, this implementation considers all the possible
+# sentences that could be created through combinations of all possible
+# corrections for all the words in a sentence.
+# e.g. "This is a test" -> if each word has 5 possible corrections,
+# then there are 5^4 possible resulting sentences.
+# We calculate the probability of each sentence (using the same concepts
+# of start probabilities, emission probabilities, and transition
+# probabilities) and choose the sentence (word combination) with the
+# highest probability.
+#
+# As expected, we found that this approach yielded similar corrections
+# in many cases, but not always. Despite not being a faithful
+# representation of the original algorithm, this implementation allowed
+# us to experiment with a different way of parallelizing the problem
+# of context-level checking.
 #
 ######################
 
 def dameraulevenshtein(seq1, seq2):
     '''
     Calculate the Damerau-Levenshtein distance between sequences.
+
+    codesnippet:D0DE4716-B6E6-4161-9219-2903BF8F547F
+    Conceptually, this is based on a len(seq1) + 1 * len(seq2) + 1
+    matrix. However, only the current and two previous rows are
+    needed at once, so we only store those.
+
     Same code as word-level checking.
     '''
-    
-    # codesnippet:D0DE4716-B6E6-4161-9219-2903BF8F547F
-    # Conceptually, this is based on a len(seq1) + 1 * len(seq2) + 1
-    # matrix. However, only the current and two previous rows are
-    # needed at once, so we only store those.
     
     oneago = None
     thisrow = range(1, len(seq2) + 1) + [0]
     
     for x in xrange(len(seq1)):
         
-        # Python lists wrap around for negative indices, so put the
-        # leftmost column at the *end* of the list. This matches with
-        # the zero-indexed strings and saves extra calculation.
         twoago, oneago, thisrow = \
             oneago, thisrow, [0] * len(seq2) + [x + 1]
         
@@ -391,25 +521,34 @@ def dameraulevenshtein(seq1, seq2):
             addcost = thisrow[y - 1] + 1
             subcost = oneago[y - 1] + (seq1[x] != seq2[y])
             thisrow[y] = min(delcost, addcost, subcost)
-            # This block deals with transpositions
+
             if (x > 0 and y > 0 and seq1[x] == seq2[y - 1]
                 and seq1[x-1] == seq2[y] and seq1[x] != seq2[y]):
                 thisrow[y] = min(thisrow[y], twoago[y - 2] + 1)
                 
     return thisrow[len(seq2) - 1]
 
-def get_suggestions(string, dictionary, longest_word_length=20, 
-                    min_count=100, max_sug=10):
+def get_suggestions(string, dictionary, max_edit_distance, 
+                    longest_word_length=20, min_count=100, max_sug=10):
     '''
     Return list of suggested corrections for potentially incorrectly
     spelled word.
+
     Code based on get_suggestions function from word-level checking,
-    with the addition of the min_count parameter, which only
-    considers words that have occur more than min_count times in the
-    (dictionary) corpus.
+    with the addition of the min_count and max_sug parameters.
+    - min_count: minimum number of times a word must have appeared
+    in the dictionary corpus to be considered a valid suggestion
+    - max_sug: number of suggestions that are returned (ranked by
+    frequency of appearance in dictionary corpus and edit distance
+    from word being checked)
+
+    These changes were imposed in order to ensure that the problem
+    remains tractable when checking very large documents. In practice,
+    the "correct" suggestion is almost always amongst the top ten.
+
     '''
     
-    if (len(string) - longest_word_length) > MAX_EDIT_DISTANCE:
+    if (len(string) - longest_word_length) > max_edit_distance:
         # to ensure Viterbi can keep running -- use the word itself
         return [(string, 0)]
     
@@ -461,7 +600,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
                     # Levenshtein distance
                     item_dist = dameraulevenshtein(sc_item, string)
                     
-                    if item_dist<=MAX_EDIT_DISTANCE:
+                    if item_dist<=max_edit_distance:
                         # should already be in dictionary if in
                         # suggestion list
                         assert sc_item in dictionary  
@@ -474,7 +613,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
         # delete) from the queue item as additional items to check
         # -- add to end of queue
         assert len(string)>=len(q_item)
-        if (len(string)-len(q_item))<MAX_EDIT_DISTANCE \
+        if (len(string)-len(q_item))<max_edit_distance \
             and len(q_item)>1:
             for c in range(len(q_item)): # character index        
                 word_minus_c = q_item[:c] + q_item[c+1:]
@@ -486,7 +625,7 @@ def get_suggestions(string, dictionary, longest_word_length=20,
     # return list of suggestions: (correction, edit distance)
     
     # only include words that have appeared a minimum number of times
-    # make sure that we do not lose the original word
+    # note: make sure that we do not lose the original word
     as_list = [i for i in suggest_dict.items() 
                if (i[1][0]>min_count or i[0]==string)]
     
@@ -515,11 +654,13 @@ def get_emission_prob(edit_dist, poisson_lambda=0.01):
     '''
     The emission probability, i.e. P(observed word|intended word)
     is approximated by a Poisson(k, l) distribution, where 
-    k=edit distance and l=0.01.
+    k=edit distance between the observed word and the intended
+    word and l=0.01.
     
-    The lambda parameter matches the one used in the AM207
-    lecture notes. Various parameters between 0 and 1 were tested
-    to confirm that 0.01 yields the most accurate results.
+    Both the overall approach and the parameter of l=0.01 are based on
+    the 2015 lecture notes from AM207 Stochastic Optimization.
+    Various parameters for lambda between 0 and 1 were tested, which
+    confirmed that 0.01 yields the most accurate word suggestions.
     '''
     
     return math.log(poisson.pmf(edit_dist, poisson_lambda))
@@ -531,29 +672,38 @@ def get_emission_prob(edit_dist, poisson_lambda=0.01):
 ######################
 
 def get_start_prob(word, start_prob, default_start_prob):
+    '''
+    P(word being at the beginning of a sentence)
+    '''
     try:
         return start_prob[word]
     except KeyError:
         return default_start_prob
     
-def get_transition_prob(cur_word, prev_word, transition_prob, 
-                        default_transition_prob):
+def get_transition_prob(cur_word, prev_word, 
+                        transition_prob, default_transition_prob):
+    '''
+    P(word|previous word)
+    '''
     try:
         return transition_prob[prev_word][cur_word]
     except KeyError:
         return default_transition_prob
 
-def get_belief(prev_word, prev_belief):
-    try:
-        return prev_belief[prev_word]
-    except KeyError:
-        return math.log(math.exp(min(prev_belief.values()))/2.)  
-
-def map_sentence_words(sentence, tmp_dict):
-    return [[word, get_suggestions(word, tmp_dict)] 
+def map_sentence_words(sentence, tmp_dict, max_edit_distance):
+    '''
+    Helper function: returns all suggestions for all words
+    in a sentence.
+    '''
+    return [[word, get_suggestions(word, tmp_dict, max_edit_distance)] 
             for i, word in enumerate(sentence)]
 
 def split_suggestions(sentence):
+    '''
+    Helper function: create word-suggestion pairs for each
+    word in the sentence, and look up the emission probability
+    of each pair.
+    '''
     result = []
     for word in sentence:
         result.append([(word[0], s[0], get_emission_prob(s[1])) 
@@ -561,11 +711,14 @@ def split_suggestions(sentence):
     return result
 
 def get_word_combos(sug_lists):
+    '''
+    Helper function: returns all possible sentences that can be
+    created from the list of suggestions for each word in the
+    original sentence.
+    e.g. a sentence with 5 words and 10 suggestions per word
+    will result in 10^6 possible sentences.
+    '''
     return list(itertools.product(*sug_lists))
-
-def split_combos(combos):
-    sent_id, combo_list = combos
-    return [[sent_id, c] for c in combo_list]
 
 def get_combo_prob(combo, tmp_sp, d_sp, tmp_tp, d_tp):
     
@@ -583,47 +736,72 @@ def get_combo_prob(combo, tmp_sp, d_sp, tmp_tp, d_tp):
     
     return orig_path, sug_path, prob
 
-def get_count_mismatches_prob(sentences):
+def get_count_mismatches(sentences):
+    '''
+    Helper function: compares the original sentence with the sentence
+    that has been suggested by the Viterbi algorithm, and calculates
+    the number of words that do not match.
+    '''
     orig_sentence, sug_sentence, prob = sentences
     count_mismatches = len([(orig_sentence[i], sug_sentence[i]) 
             for i in range(len(orig_sentence))
             if orig_sentence[i]!=sug_sentence[i]])
     return count_mismatches, orig_sentence, sug_sentence
 
-def correct_document_context_parallel_combos(fname, dictionary,
+def correct_document_context_parallel_approximate(fname, dictionary,
                              start_prob, default_start_prob,
-                             transition_prob, default_transition_prob):
+                             transition_prob, default_transition_prob,
+                             max_edit_distance=3, num_partitions=6,
+                             display_results=False):
     
+    '''
+    Load a text file and spell-check each sentence using the
+    dictionary and probability tables that were created in the
+    pre-processing stage.
+
+    Suggested corrections are either printed to the screen or
+    saved in a log file, depending on the settings.
+    '''
+
     ############
     #
     # load file & initial processing
     #
     ############
     
-    # broadcast Python dictionaries to workers
+    # http://stackoverflow.com/questions/22520932/python-remove-all-non-alphabet-chars-from-string
+    regex = re.compile('[^a-z ]')
+    
+    # broadcast Python dictionaries to workers (from pre-processing)
     bc_dictionary = sc.broadcast(dictionary)
     bc_start_prob = sc.broadcast(start_prob)
     bc_transition_prob = sc.broadcast(transition_prob)
     
-    # convert all text to lowercase and drop empty lines
+    # load file contents and convert into one long sequence of words
+    # RDD format: 'line 1', 'line 2', 'line 3', ...
     make_all_lower = sc.textFile(fname) \
-        .map(lambda line: line.lower()) \
-        .filter(lambda x: x!='')
+            .map(lambda line: line.lower()) \
+            .filter(lambda x: x!='')
     
-    regex = re.compile('[^a-z ]')
-    
-    # split into sentences -> remove special characters -> convert into list of words
+    # split into individual sentences and remove other punctuation
+    # RDD format: [words of sentence1], [words of sentence2], ...
+    # cache because this RDD is used in multiple operations 
     split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
             .map(lambda sentence: regex.sub(' ', sentence)) \
-            .map(lambda sentence: sentence.split()).cache()
+            .map(lambda sentence: sentence.split()) \
+            .filter(lambda x: x!=[]).cache()
     
     # use accumulator to count the number of words checked
     accum_total_words = sc.accumulator(0)
-    split_words = split_sentence.flatMap(lambda x: x).foreach(lambda x: accum_total_words.add(1))
+    split_sentence.flatMap(lambda x: x) \
+            .foreach(lambda x: accum_total_words.add(1))
     
-    # assign each sentence a unique id
-    sentence_id = split_sentence.zipWithIndex() \
-            .map(lambda (k, v): (v, k)).cache()
+    # assign a unique id to each sentence
+    # RDD format: (0, [words of sentence1]), (1, [words of sentence2]), ...
+    # cache here after completing transformations - results in 
+    # improvements in runtime that scale with file size
+    sentence_id = split_sentence.zipWithIndex().map(
+        lambda (k, v): (v, k)).cache()
     
     ############
     #
@@ -632,57 +810,152 @@ def correct_document_context_parallel_combos(fname, dictionary,
     ############
     
     # look up possible suggestions for each word in each sentence
-    sentence_words = sentence_id.mapValues(lambda v: map_sentence_words(v, bc_dictionary.value))
+    # RDD format:
+    # (sentence id, [[word, [suggestions]], [word, [suggestions]], ... ]),
+    # (sentence id, [[word, [suggestions]], [word, [suggestions]], ... ]), ...
+    sentence_words = sentence_id.mapValues(lambda v: 
+        map_sentence_words(v, bc_dictionary.value, max_edit_distance))
     
     # look up emission probabilities for each word
     # i.e. P(observed word|intended word)
-    sentence_word_sug = sentence_words.mapValues(lambda v: split_suggestions(v))
+    # RDD format: (one list of tuples per word in the sentence)
+    # (sentence id, [(original word, suggested word, P(original|suggested)),
+    #                (original word, suggested word, P(original|suggested)), ...]), ...
+    sentence_word_sug = sentence_words.mapValues(lambda v: 
+        split_suggestions(v))
     
-    # generate all possible corrected combinations (using Cartesian product)
-    # i.e. a sentence with 4 word, each of which have 5 possible suggestions,
-    # will yield 5^4 possible combinations
-    sentence_word_combos = sentence_word_sug.mapValues(lambda v: get_word_combos(v))
+    # generate all possible corrected combinations (using Cartesian
+    # product) - i.e. a sentence with 4 word, each of which have 5 
+    # possible suggestions, will yield 5^4 possible combinations
+    # RDD format: (a tuple of tuples for each combination)
+    # (sentence id, [(original word1, suggested word1, P(original1|suggested1)),
+    #                (original word2, suggested word2, P(original2|suggested2)), ...]), ...
+    sentence_word_combos = sentence_word_sug.mapValues(lambda v:
+        get_word_combos(v))
     
     # flatmap into all possible combinations per sentence
-    # format: [sentence id, 
-    # [(observed first word, potential first word, P(observed first word|intended first word)]), 
-    # (observed second word, potential second word, P(observed second word|intended second word)]), ...]
-    sentence_word_combos_split = sentence_word_combos.flatMap(lambda x: split_combos(x))
+    # RDD format: (a tuple of tuples for one combination)
+    # (sentence id, [(original word1, suggested word1, P(original1|suggested1)),
+    #                (original word2, suggested word2, P(original2|suggested2)), ...]), ...
+    # partitioning after the flatmap results in a small improvement in runtime
+    # for the smaller texts on which we were able to run the function
+    sentence_word_combos_split = sentence_word_combos.flatMapValues(lambda x: x) \
+            .partitionBy(num_partitions).cache()
     
-    # calculate the probability of each word combination being the intended one, given what was observed
-    # note: the approach does not allow for normalization across iterations, so may yield different results
-    sentence_word_combos_prob = sentence_word_combos_split.mapValues(lambda v:  
-                                get_combo_prob(v, bc_start_prob.value, default_start_prob, 
-                                               bc_transition_prob.value, default_transition_prob))
+    # calculate the probability of each word combination being the
+    # intended one, given what was actually typed
+    # note: the approach does not drop any word combinations, so may
+    # yield different results to the Viterbi algorithm
+    # RDD format: 
+    # (sentence id, ([original sentence], [suggested sentence], probability)),
+    # (sentence id, ([original sentence], [suggested sentence], probability)), ...
+    sentence_word_combos_prob = sentence_word_combos_split.mapValues(
+        lambda v: get_combo_prob(v, bc_start_prob.value, default_start_prob, 
+            bc_transition_prob.value, default_transition_prob))
     
-    # identify the word combination with the highest probability for each sentence
-    sentence_max_prob = sentence_word_combos_prob.reduceByKey(lambda a,b: a if a[2] > b[2] else b)
+    # identify the word combination with the highest probability for
+    # each sentence
+    # (sentence id, ([original sentence], [suggested sentence], probability)),
+    # (sentence id, ([original sentence], [suggested sentence], probability)), ...
+    sentence_max_prob = sentence_word_combos_prob.reduceByKey(
+        lambda a,b: a if a[2] > b[2] else b)
 
     ############
     #
     # output results
     #
     ############
-    
-    # count the number of errors per sentence, drop any sentences without errors
-    sentence_errors = sentence_max_prob.mapValues(lambda v: (get_count_mismatches_prob(v))) \
-            .filter(lambda (k, v): v[0]>0).cache()
-               
-    # collect all sentences with identified errors
+
+    # count the number of errors per sentence and drop any sentences
+    # without errors
+    # RDD format: (sentence id, (# errors, [original sentence], [suggested sentence])),
+    #             (sentence id, (# errors, [original sentence], [suggested sentence])), ...
+    sentence_errors = sentence_max_prob.mapValues(
+        lambda v: get_count_mismatches(v)) \
+            .filter(lambda (k, v): v[0]>0)
+
+    # collect all sentences with identified errors (as list)
     sentence_errors_list = sentence_errors.collect()
     
-    # number of potentially misspelled words
+    # count the number of potentially misspelled words
     num_errors = sum([s[1][0] for s in sentence_errors_list])
     
-    # print identified errors (eventually output to file)
-    for sentence in sentence_errors_list:
-        print 'Sentence %i: %s --> %s' % (sentence[0], ' '.join(sentence[1][1]), ' '.join(sentence[1][2]))
+    # print suggested corrections
+    if display_results:
+        for sentence in sentence_errors_list:
+            print 'Sentence %i: %s --> %s' % (sentence[0],
+                ' '.join(sentence[1][1]), ' '.join(sentence[1][2]))
+            print '-----'
+    
+    # output suggested corrections to file
+    else:
+        f = open('spell-log.txt', 'w')
+        for sentence in sentence_errors_list:
+            f.write('Sentence %i: %s --> %s\n' % (sentence[0], 
+                ' '.join(sentence[1][1]), ' '.join(sentence[1][2])))
+        f.close()
     
     print '-----'
     print 'Total words checked: %i' % accum_total_words.value
     print 'Total potential errors found: %i' % num_errors
 
+def main(argv):
+    '''
+    Parse command line parameters (if any).
+
+    Command line parameters are expected to take the form:
+    -d : dictionary file
+    -c : spell-checking file
+
+    Default values are applied where files are not provided.
+    https://docs.python.org/2/library/getopt.html
+    '''
+
+    # default values - use if not overridden
+    dictionary_file = 'testdata/big.txt'
+    check_file = 'testdata/yelp100reviews.txt'
+
+    # read in command line parameters (if any)
+    try:
+        opts, args = getopt.getopt(argv,'d:c:',['dfile=','cfile='])
+    except getopt.GetoptError:
+        print 'contextSerial.py -d <dfile> -c <cfile>'
+        print 'Default values will be applied.'
+
+    # parse command line parameters    
+    for opt, arg in opts:
+        if opt in ('-d', '--dictionary'):
+            dictionary_file = arg
+        elif opt in ('-c', '--cfile'):
+            check_file = arg
+
+    # return command line parameters (or default values if not provided)
+    return dictionary_file, check_file
+
 if __name__ == '__main__':
+
+    ############
+    #
+    # get input files and check that they are valid
+    #
+    ############
+
+    # dictionary_file = used for pre-processing steps
+    # check_file = text to be spell-checked
+    dictionary_file, check_file = main(sys.argv[1:])
+
+    dict_valid = os.path.isfile(dictionary_file)
+    check_valid = os.path.isfile(check_file)
+
+    if not dict_valid and not check_valid:
+        print 'Invalid dictionary and spellchecking files. Could not run.'
+        sys.exit()
+    elif not dict_valid:
+        print 'Invalid dictionary file. Could not run.'
+        sys.exit()
+    elif not check_valid:
+        print 'Invalid spellchecking file. Could not run.'
+        sys.exit()
 
     ############
     #
@@ -690,9 +963,7 @@ if __name__ == '__main__':
     #
     ############
 
-    dictionary_file = 'testdata/big.txt'
-
-    print 'Creating dictionary with %s...' % dictionary_file
+    print 'Pre-processing with %s...' % dictionary_file
 
     start_time = time.time()
 
@@ -701,7 +972,9 @@ if __name__ == '__main__':
 
     run_time = time.time() - start_time
 
+    print '-----'
     print '%.2f seconds to run' % run_time
+    print '-----'
 
     ############
     #
@@ -709,16 +982,16 @@ if __name__ == '__main__':
     #
     ############
 
-    check_file = 'testdata/test.txt'
+    print 'Spell-checking %s...' % check_file
 
     start_time = time.time()
 
-    print 'Spell-checking %s...' % check_file
-
-    correct_document_context_parallel_combos(check_file, dictionary,
-            start_prob, default_start_prob, transition_prob, default_transition_prob)
+    correct_document_context_parallel_approximate(check_file, dictionary,
+                            start_prob, default_start_prob, 
+                            transition_prob, default_transition_prob)
 
     run_time = time.time() - start_time
 
+    print '-----'
     print '%.2f seconds to run' % run_time
-
+    print '-----'

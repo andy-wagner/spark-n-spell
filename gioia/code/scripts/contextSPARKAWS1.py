@@ -1,4 +1,4 @@
-# contextSerial.py - Serial implementation
+# contextSPARK1.py - SPARK implementation, naive parallelization
 
 import re
 import math
@@ -7,6 +7,12 @@ import time
 import sys, getopt
 import os
 
+# Initialize Spark
+from pyspark import SparkContext
+sc = SparkContext()
+sc.setLogLevel('ERROR')
+os.environ['PYSPARK_PYTHON']='/usr/bin/python2.7'
+
 ######################
 #
 # Submission by Gioia Dominedo (Harvard ID: 40966234) for
@@ -14,8 +20,8 @@ import os
 # 
 # This is part of a joint project with Kendrick Lo that includes a
 # separate component for word-level checking. This script includes 
-# serial Python code for context-level spell-checking adapted
-# from third party algorithms (Symspell and Viterbi algorithms). 
+# one of three SPARK implementations for context-level spell-checking
+# adapted from third party algorithms (Symspell and Viterbi algorithms). 
 #
 # The following were also used as references:
 # Peter Norvig, How to Write a Spelling Corrector
@@ -29,7 +35,7 @@ import os
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 5 Dec 2015
+# v 1.0 last revised 3 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition
@@ -38,7 +44,7 @@ import os
 # probabilities are generated on the fly by parameterizing a Poisson 
 # distribution with the edit distance between words and suggested
 # corrections.
-
+#
 # The state space of possible corrections for each word is generated
 # using logic based on the Symspell spell-checker (see below for more
 # detail on Symspell). Valid suggestions must: (a) be 'real' words;
@@ -52,6 +58,27 @@ import os
 # the dictionary and/or probability tables.
 #
 # More detail on the specific implementation is included below.
+#
+######################
+
+######################
+#
+# SPARK IMPLEMENTATION DETAILS - NAIVE PARALLELIZATION
+#
+# This is the first attempt at parallelizing the Viterbi algorithm.
+#
+# For this implementation we create an RDD where each element
+# corresponds to a sentence from the document to be checked, and
+# then use a map operation to call the Viterbi function for each
+# sentence.
+#
+# This approach takes advantage of parallelization by splitting the
+# sentences among the workers (i.e. increasing the number of workers
+# will improve the runtime), but does not parallelize the algorithm
+# itself.
+#
+# Note: all the functions related to the Viterbi algorithm are the
+# same as those used in the serial implementation.
 #
 ######################
 
@@ -102,7 +129,11 @@ import os
 def get_deletes_list(w, max_edit_distance):
     '''
     Given a word, derive strings with up to max_edit_distance
-    characters deleted.
+    characters deleted. 
+
+    The list is generally of the same magnitude as the number of
+    characters in a word, so it does not make sense to parallelize
+    this function. Instead, we use Python to create the list.
     '''
     deletes = []
     queue = [w]
@@ -120,136 +151,241 @@ def get_deletes_list(w, max_edit_distance):
         
     return deletes
 
-def create_dictionary_entry(w, dictionary, max_edit_distance):
+def get_transitions(sentence):
     '''
-    Add a word and its derived deletions to the dictionary.
-    Dictionary entries are of the form:
-    ([list of suggested corrections], frequency of word in corpus)
-    '''
-
-    new_real_word_added = False
-    
-    # check if word is already in dictionary
-    if w in dictionary:
-        # increment count of word in corpus
-        dictionary[w] = (dictionary[w][0], dictionary[w][1] + 1)
+    Helper function: converts a sentence into all two-word pairs.
+    Output format is a list of tuples.
+    e.g. 'This is a test' >> ('this', 'is'), ('is', 'a'), ('a', 'test')
+    ''' 
+    if len(sentence)<2:
+        return None
     else:
-        # create new entry in dictionary
-        dictionary[w] = ([], 1)  
-        
-    if dictionary[w][1]==1:
-        
-        # first appearance of a word in the corpus
-        # note: word may already be in dictionary as a derived word
-        # (e.g. by deleting character from a real word) but the
-        # word counter frequency is not incremented in those cases
-        
-        new_real_word_added = True
-        deletes = get_deletes_list(w, max_edit_distance)
-        
-        for item in deletes:
-            if item in dictionary:
-                # add (correct) word to delete's suggested correction
-                # list if not already there
-                if item not in dictionary[item][0]:
-                    dictionary[item][0].append(w)
-            else:
-                # note: frequency of word in corpus is not incremented
-                dictionary[item] = ([w], 0)  
-        
-    return new_real_word_added
+        return [((sentence[i], sentence[i+1]), 1) 
+                for i in range(len(sentence)-1)]
+    
+def map_transition_prob(vals):
+    '''
+    Helper function: calculates conditional probabilities for all word
+    pairs, i.e. P(word|previous word)
+    '''
+    total = float(sum(vals.values()))
+    return {k: math.log(v/total) for k, v in vals.items()}
 
-def pre_processing(fname, max_edit_distance=3):
+def parallel_create_dictionary(fname, max_edit_distance=3, 
+                                num_partitions=256):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
     '''
-
-    dictionary = dict()
-    start_prob = dict()
-    transition_prob = dict()
-    word_count = 0
-    transitions = 0
     
-    with open(fname) as file:    
-        
-        for line in file:
-            
-            # process each sentence separately
-            for sentence in line.split('.'):
-                
-                # separate by words by non-alphabetical characters
-                words = re.findall('[a-z]+', sentence.lower())      
-                
-                for w, word in enumerate(words):
-                    
-                    # create/update dictionary entry
-                    if create_dictionary_entry(
-                        word, dictionary, max_edit_distance):
-                            word_count += 1
-                        
-                    # update probabilities for Hidden Markov Model
-                    if w == 0:
+    # Note: this function makes use of multiple accumulators to keep
+    # track of the words that are being processed. An alternative 
+    # implementation that wraps accumulators in helper functions was
+    # also tested, but did not yield any noticeable improvements.
 
-                        # probability of a word being at the
-                        # beginning of a sentence
-                        if word in start_prob:
-                            start_prob[word] += 1
-                        else:
-                            start_prob[word] = 1
-                    else:
-                        
-                        # probability of transitionining from one
-                        # word to another
-                        # dictionary format:
-                        # {previous word: {word1 : P(word1|prevous
-                        # word), word2 : P(word2|prevous word)}}
-                        
-                        # check whether prior word is present
-                        # - create if not
-                        if words[w - 1] not in transition_prob:
-                            transition_prob[words[w - 1]] = dict()
-                            
-                        # check whether current word is present
-                        # - create if not
-                        if word not in transition_prob[words[w - 1]]:
-                            transition_prob[words[w - 1]][word] = 0
-                            
-                        # update value
-                        transition_prob[words[w - 1]][word] += 1
-                        transitions += 1
-                    
-    # convert counts to log-probabilities, to avoid underflow in
-    # later calculations (note: natural logarithm, not base-10)
-
-    # also calculate (smalle) default probabilities for words that 
-    # have not already been seen
+    ############
+    #
+    # load file & initial processing
+    #
+    ############
     
-    # probability of a word being at the beginning of a sentence
-    total_start_words = float(sum(start_prob.values()))
+    # http://stackoverflow.com/questions/22520932/python-remove-all-non-alphabet-chars-from-string
+    regex = re.compile('[^a-z ]')
+
+    # load file contents and convert into one long sequence of words
+    # RDD format: 'line 1', 'line 2', 'line 3', ...
+    # cache because this RDD is used in multiple operations 
+    make_all_lower = sc.textFile(fname) \
+            .map(lambda line: line.lower()) \
+            .filter(lambda x: x!='').cache()
+    
+    # split into individual sentences and remove other punctuation
+    # RDD format: [words of sentence 1], [words of sentence 2], ...
+    # cache because this RDD is used in multiple operations 
+    split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
+            .map(lambda sentence: regex.sub(' ', sentence)) \
+            .map(lambda sentence: sentence.split()).cache()
+    
+    ############
+    #
+    # generate start probabilities
+    #
+    ############
+    
+    # extract all words that are at the beginning of sentences
+    # RDD format: 'word1', 'word2', 'word3', ...
+    start_words = split_sentence.map(lambda sentence: sentence[0] 
+        if len(sentence)>0 else None) \
+            .filter(lambda word: word!=None)
+    
+    # add a count to each word
+    # RDD format: ('word1', 1), ('word2', 1), ('word3', 1), ...
+    # note: partition here because we are using words as keys for
+    # the first time - yields a small but consistent improvement in
+    # runtime (~2-3 sec for big.txt)
+    # cache because this RDD is used in multiple operations
+    count_start_words_once = start_words.map(lambda word: (word, 1)) \
+            .partitionBy(num_partitions).cache()
+
+    # use accumulator to count the number of start words processed
+    accum_total_start_words = sc.accumulator(0)
+    count_start_words_once.foreach(lambda x: accum_total_start_words.add(1))
+    total_start_words = float(accum_total_start_words.value)
+    
+    # reduce into count of unique words at the start of sentences
+    # RDD format: ('word1', frequency), ('word2', frequency), ...
+    unique_start_words = count_start_words_once.reduceByKey(lambda a, b: a + b)
+    
+    # convert counts to log-probabilities
+    # RDD format: ('word1', log-prob of word1), 
+    #             ('word2', log-prob of word2), ...
+    start_prob_calc = unique_start_words.mapValues(lambda v: 
+        math.log(v/total_start_words))
+    
+    # get default start probabilities (for words not in corpus)
     default_start_prob = math.log(1/total_start_words)
-    start_prob.update( 
-        {k: math.log(v/total_start_words)
-         for k, v in start_prob.items()})
     
-    # probability of transitioning from one word to another
-    default_transition_prob = math.log(1./transitions)
-    transition_prob.update(
-        {k: {k1: math.log(float(v1)/sum(v.values()))
-             for k1, v1 in v.items()} 
-         for k, v in transition_prob.items()})
+    # store start probabilities as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
+    start_prob = start_prob_calc.collectAsMap()
+    
+    ############
+    #
+    # generate transition probabilities
+    #
+    ############
+    
+    # note: various partitioning strategies were attempted for this
+    # portion of the function, but they failed to yield significant
+    # improvements in performance.
 
-    # output summary statistics
-    print 'Total unique words in corpus: %i' % word_count
-    print 'Total items in dictionary: %i' \
+    # focus on continuous word pairs within the sentence
+    # e.g. "this is a test" -> "this is", "is a", "a test"
+    # note: as the relevant probability is P(word|previous word)
+    # the tuples are ordered as (previous word, word)
+
+    # extract all word pairs within a sentence and add a count
+    # RDD format: (('word1', 'word2'), 1), (('word2', 'word3'), 1), ...
+    # cache because this RDD is used in multiple operations 
+    other_words = split_sentence.map(lambda sentence: 
+        get_transitions(sentence)) \
+            .filter(lambda x: x!=None) \
+            .flatMap(lambda x: x).cache()
+
+    # use accumulator to count the number of transitions (word pairs)
+    accum_total_other_words = sc.accumulator(0)
+    other_words.foreach(lambda x: accum_total_other_words.add(1))
+    total_other_words = float(accum_total_other_words.value)
+    
+    # reduce into count of unique word pairs
+    # RDD format: (('word1', 'word2'), frequency), 
+    #             (('word2', 'word3'), frequency), ...
+    unique_other_words = other_words.reduceByKey(lambda a, b: a + b)
+    
+    # aggregate by (and change key to) previous word
+    # RDD format: ('previous word', {'word1': word pair count, 
+    #                                'word2': word pair count}}), ...
+    other_words_collapsed = unique_other_words.map(lambda x: 
+        (x[0][0], (x[0][1], x[1]))) \
+            .groupByKey().mapValues(dict)
+
+    # note: the above line of code is the slowest in the function
+    # (8.6 MB shuffle read and 4.5 MB shuffle write for big.txt)
+    # An alternative approach that aggregates lists with reduceByKey was
+    # attempted, but did not yield noticeable improvements in runtime.
+    
+    # convert counts to log-probabilities
+    # RDD format: ('previous word', {'word1': log-prob of pair, 
+    #                                 word2: log-prob of pair}}), ...
+    transition_prob_calc = other_words_collapsed.mapValues(lambda v: 
+        map_transition_prob(v))
+
+    # get default transition probabilities (for word pairs not in corpus)
+    default_transition_prob = math.log(1/total_other_words)
+    
+    # store transition probabilities as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
+    transition_prob = transition_prob_calc.collectAsMap()
+    
+    ############
+    #
+    # generate dictionary
+    #
+    ############
+
+    # note: this approach is slightly different from the original SymSpell
+    # algorithm, but is more appropriate for a SPARK implementation
+    
+    # split into individual words (all)
+    # RDD format: 'word1', 'word2', 'word3', ...
+    # cache because this RDD is used in multiple operations 
+    all_words = make_all_lower.map(lambda line: regex.sub(' ', line)) \
+            .flatMap(lambda line: line.split()).cache()
+
+    # use accumulator to count the number of words processed
+    accum_words_processed = sc.accumulator(0)
+    all_words.foreach(lambda x: accum_words_processed.add(1))
+
+    # add a count to each word
+    # RDD format: ('word1', 1), ('word2', 1), ('word3', 1), ...
+    count_once = all_words.map(lambda word: (word, 1))
+
+    # reduce into counts of unique words - this is the core corpus dictionary
+    # (i.e. only words appearing in the file, without 'deletes'))
+    # RDD format: ('word1', frequency), ('word2', frequency), ...
+    # cache because this RDD is used in multiple operations 
+    # note: imposing partitioning at this step yields a small 
+    # improvement in runtime (~1 sec for big.txt) by equally
+    # balancing elements among workers for subsequent operations
+    unique_words_with_count = count_once.reduceByKey(lambda a, b: a + b, 
+        numPartitions = num_partitions).cache()
+    
+    # use accumulator to count the number of unique words
+    accum_unique_words = sc.accumulator(0)
+    unique_words_with_count.foreach(lambda x: accum_unique_words.add(1))
+
+    # generate list of "deletes" for each word in the corpus
+    # RDD format: (word1, [deletes for word1]), (word2, [deletes for word2]), ...
+    generate_deletes = unique_words_with_count.map(lambda (parent, count): 
+        (parent, get_deletes_list(parent, max_edit_distance)))
+    
+    # split into all key-value pairs
+    # RDD format: (word1, delete1), (word1, delete2), ...
+    expand_deletes = generate_deletes.flatMapValues(lambda x: x)
+    
+    # swap word order and add a zero count (because "deletes" were not
+    # present in the dictionary)
+    swap = expand_deletes.map(lambda (orig, delete): (delete, ([orig], 0)))
+    
+    # create a placeholder for each real word
+    # RDD format: ('word1', ([], frequency)), ('word2', ([], frequency)), ...
+    corpus = unique_words_with_count.mapValues(lambda count: ([], count))
+
+    # combine main dictionary and "deletes" (and eliminate duplicates)
+    # RDD format: ('word1', ([deletes for word1], frequency)), 
+    #             ('word2', ([deletes for word2], frequency)), ...
+    combine = swap.union(corpus)
+    
+    # store dictionary items and deletes as a dictionary (i.e. a lookup table)
+    # note: given the spell-checking algorithm, this cannot be maintained
+    # as an RDD as it is not possible to map within a map
+    # note: use reduceByKeyLocally to avoid an extra shuffle from reduceByKey
+    dictionary = combine.reduceByKeyLocally(lambda a, b: (a[0]+b[0], a[1]+b[1])) 
+    
+    # output stats
+    print 'Total words processed: %i' % accum_words_processed.value
+    print 'Total unique words in corpus: %i' % accum_unique_words.value 
+    print 'Total items in dictionary (corpus words and deletions): %i' \
         % len(dictionary)
     print '  Edit distance for deletions: %i' % max_edit_distance
     print 'Total unique words at the start of a sentence: %i' \
         % len(start_prob)
     print 'Total unique word transitions: %i' % len(transition_prob)
-        
+    
     return dictionary, start_prob, default_start_prob, \
-        transition_prob, default_transition_prob
+            transition_prob, default_transition_prob
 
 ######################
 #
@@ -680,10 +816,23 @@ def viterbi(words, dictionary, start_prob, default_start_prob,
 
     return path_context
 
-def correct_document_context(fname, dictionary, 
+def get_count_mismatches(sentences):
+    '''
+    Helper function: compares the original sentence with the sentence
+    that has been suggested by the Viterbi algorithm, and calculates
+    the number of words that do not match.
+    '''
+    orig_sentence, sug_sentence = sentences
+    count_mismatches = len([(orig_sentence[i], sug_sentence[i]) 
+            for i in range(len(orig_sentence))
+            if orig_sentence[i]!=sug_sentence[i]])
+    return count_mismatches, orig_sentence, sug_sentence
+
+def correct_document_context_parallel_naive(fname, dictionary,
                              start_prob, default_start_prob,
                              transition_prob, default_transition_prob,
-                             max_edit_distance=3, display_results=False):
+                             max_edit_distance=3, num_partitions=256,
+                             display_results=False):
     
     '''
     Load a text file and spell-check each sentence using the
@@ -694,51 +843,89 @@ def correct_document_context(fname, dictionary,
     saved in a log file, depending on the settings.
     '''
 
-    doc_word_count = 0
-    corrected_word_count = 0
-    sentence_errors_list = []
-    total_sentences = 0
+    # note: various partitioning strategies were attempted for this
+    # function, but they failed to yield significant improvements in
+    # performance at any file size.
+
+    ############
+    #
+    # load file & initial processing
+    #
+    ############
     
-    with open(fname) as file:
+    # http://stackoverflow.com/questions/22520932/python-remove-all-non-alphabet-chars-from-string
+    regex = re.compile('[^a-z ]')
+
+    # broadcast Python dictionaries to workers (from pre-processing)
+    bc_dictionary = sc.broadcast(dictionary)
+    bc_start_prob = sc.broadcast(start_prob)
+    bc_transition_prob = sc.broadcast(transition_prob)
+    
+    # load file contents and convert into one long sequence of words
+    # RDD format: 'line 1', 'line 2', 'line 3', ...
+    make_all_lower = sc.textFile(fname) \
+            .map(lambda line: line.lower()) \
+            .filter(lambda x: x!='')
         
-        for i, line in enumerate(file):
-            
-            for sentence in line.split('.'):
-                
-                # separate by words by non-alphabetical characters
-                words = re.findall('[a-z]+', sentence.lower())  
-                doc_word_count += len(words)
-                
-                if len(words) > 0:
-                
-                    # run Viterbi algorithm for each sentence and
-                    # obtain most likely correction (may be the same
-                    # as the original sentence)
-                    suggestion = viterbi(words, dictionary,
-                                start_prob, default_start_prob, 
-                                transition_prob, default_transition_prob,
-                                max_edit_distance)
+    # split into individual sentences and remove other punctuation
+    # RDD format: [words of sentence1], [words of sentence2], ...
+    # cache because this RDD is used in multiple operations 
+    split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
+            .map(lambda sentence: regex.sub(' ', sentence)) \
+            .map(lambda sentence: sentence.split()) \
+            .filter(lambda x: x!=[]).cache()
+    
+    # use accumulator to count the number of words checked
+    accum_total_words = sc.accumulator(0)
+    split_sentence.flatMap(lambda x: x) \
+            .foreach(lambda x: accum_total_words.add(1))
+    
+    # assign a unique id to each sentence
+    # RDD format: (0, [words of sentence1]), (1, [words of sentence2]), ...
+    # cache here after completing transformations - results in 
+    # improvements in runtime that scale with file size
+    sentence_id = split_sentence.zipWithIndex().map(
+        lambda (k, v): (v, k)).cache()
 
-                    # display sentences with suggested changes
-                    if words != suggestion:
-                        
-                        # keep track of all potential errors
-                        sentence_errors_list.append([total_sentences, 
-                            (words, suggestion)])
+    ############
+    #
+    # spell-checking
+    #
+    ############
 
-                        # update count of corrected words
-                        corrected_word_count += \
-                        sum([words[j]!=suggestion[j] 
-                             for j in range(len(words))])
-                        
-                    # used for display purposes
-                    total_sentences += 1
-  
+    # use map operation to apply Viterbi algorithm to each sentence
+    # RDD format: (0, [original sentence1], [corrected sentence1]),
+    #             (1, [original sentence2], [corrected sentence2]), ...
+    sentence_correction = sentence_id.mapValues(lambda v: (v, 
+                viterbi(v, bc_dictionary.value, bc_start_prob.value, 
+                        default_start_prob, bc_transition_prob.value, 
+                        default_transition_prob, max_edit_distance)))
+    ############
+    #
+    # output results
+    #
+    ############
+    
+    # count the number of corrections per sentence and drop any
+    # sentences without suggested corrections
+    # RDD format: 
+    # (0, (corrections, [original sentence1], [corrected sentence1])),
+    # (1, (corrections, [original sentence2], [corrected sentence2])), ...
+    sentence_errors = sentence_correction.mapValues(lambda v: 
+        (get_count_mismatches(v))). \
+            filter(lambda (k, v): v[0]>0)
+    
+    # collect all sentences with identified errors (as list)
+    sentence_errors_list = sentence_errors.collect()
+    
+    # count the number of potentially misspelled words
+    num_errors = sum([s[1][0] for s in sentence_errors_list])
+    
     # print suggested corrections
     if display_results:
         for sentence in sentence_errors_list:
             print 'Sentence %i: %s --> %s' % (sentence[0],
-                ' '.join(sentence[1][0]), ' '.join(sentence[1][1]))
+                ' '.join(sentence[1][1]), ' '.join(sentence[1][2]))
             print '-----'
     
     # output suggested corrections to file
@@ -746,12 +933,12 @@ def correct_document_context(fname, dictionary,
         f = open('spell-log.txt', 'w')
         for sentence in sentence_errors_list:
             f.write('Sentence %i: %s --> %s\n' % (sentence[0], 
-                ' '.join(sentence[1][0]), ' '.join(sentence[1][1])))
+                ' '.join(sentence[1][1]), ' '.join(sentence[1][2])))
         f.close()
-            
-    # display summary statistics
-    print 'Total words checked: %i' % doc_word_count
-    print 'Total potential errors found: %i' % corrected_word_count
+    
+    print '-----'
+    print 'Total words checked: %i' % accum_total_words.value
+    print 'Total potential errors found: %i' % num_errors
 
 def main(argv):
     '''
@@ -766,8 +953,8 @@ def main(argv):
     '''
 
     # default values - use if not overridden
-    dictionary_file = 'testdata/big.txt'
-    check_file = 'testdata/yelp100reviews.txt'
+    dictionary_file = 's3n://spark-n-spell/big.txt'
+    check_file = 's3n://spark-n-spell/yelp100reviews.txt'
 
     # read in command line parameters (if any)
     try:
@@ -798,18 +985,19 @@ if __name__ == '__main__':
     # check_file = text to be spell-checked
     dictionary_file, check_file = main(sys.argv[1:])
 
-    dict_valid = os.path.isfile(dictionary_file)
-    check_valid = os.path.isfile(check_file)
+    # Removed for AWS runs
+    # dict_valid = os.path.isfile(dictionary_file)
+    # check_valid = os.path.isfile(check_file)
 
-    if not dict_valid and not check_valid:
-        print 'Invalid dictionary and spellchecking files. Could not run.'
-        sys.exit()
-    elif not dict_valid:
-        print 'Invalid dictionary file. Could not run.'
-        sys.exit()
-    elif not check_valid:
-        print 'Invalid spellchecking file. Could not run.'
-        sys.exit()
+    # if not dict_valid and not check_valid:
+    #     print 'Invalid dictionary and spellchecking files. Could not run.'
+    #     sys.exit()
+    # elif not dict_valid:
+    #     print 'Invalid dictionary file. Could not run.'
+    #     sys.exit()
+    # elif not check_valid:
+    #     print 'Invalid spellchecking file. Could not run.'
+    #     sys.exit()
 
     ############
     #
@@ -821,9 +1009,8 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    dictionary, start_prob, default_start_prob, \
-    transition_prob, default_transition_prob \
-    = pre_processing(dictionary_file)
+    dictionary, start_prob, default_start_prob, transition_prob, default_transition_prob = \
+        parallel_create_dictionary(dictionary_file)
 
     run_time = time.time() - start_time
 
@@ -841,14 +1028,12 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    correct_document_context(check_file, dictionary,
-                             start_prob, default_start_prob, 
-                             transition_prob, default_transition_prob)
+    correct_document_context_parallel_naive(check_file, dictionary,
+                            start_prob, default_start_prob, 
+                            transition_prob, default_transition_prob)
 
     run_time = time.time() - start_time
 
     print '-----'
     print '%.2f seconds to run' % run_time
     print '-----'
-
-
