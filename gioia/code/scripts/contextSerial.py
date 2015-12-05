@@ -176,7 +176,7 @@ def pre_processing(fname, max_edit_distance=3):
         for line in file:
             
             # process each sentence separately
-            for sentence in line.split('.'):
+            for sentence in line.replace('?','.').replace('!','.').split('.'):
                 
                 # separate by words by non-alphabetical characters
                 words = re.findall('[a-z]+', sentence.lower())      
@@ -703,7 +703,7 @@ def correct_document_context(fname, dictionary,
         
         for i, line in enumerate(file):
             
-            for sentence in line.split('.'):
+            for sentence in line.replace('?','.').replace('!','.').split('.'):
                 
                 # separate by words by non-alphabetical characters
                 words = re.findall('[a-z]+', sentence.lower())  

@@ -179,7 +179,7 @@ def map_transition_prob(vals):
     return {k: math.log(v/total) for k, v in vals.items()}
 
 def parallel_create_dictionary(fname, max_edit_distance=3, 
-                                num_partitions=6):
+                                num_partitions=16):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
@@ -1092,6 +1092,39 @@ def main(argv):
     # return command line parameters (or default values if not provided)
     return dictionary_file, check_file
 
+def main(argv):
+    '''
+    Parse command line parameters (if any).
+
+    Command line parameters are expected to take the form:
+    -d : dictionary file
+    -c : spell-checking file
+
+    Default values are applied where files are not provided.
+    https://docs.python.org/2/library/getopt.html
+    '''
+
+    # default values - use if not overridden
+    dictionary_file = 's3n://spark-n-spell/big.txt'
+    check_file = 's3n://spark-n-spell/yelp100reviews.txt'
+
+    # read in command line parameters (if any)
+    try:
+        opts, args = getopt.getopt(argv,'d:c:',['dfile=','cfile='])
+    except getopt.GetoptError:
+        print 'contextSerial.py -d <dfile> -c <cfile>'
+        print 'Default values will be applied.'
+
+    # parse command line parameters    
+    for opt, arg in opts:
+        if opt in ('-d', '--dictionary'):
+            dictionary_file = arg
+        elif opt in ('-c', '--cfile'):
+            check_file = arg
+
+    # return command line parameters (or default values if not provided)
+    return dictionary_file, check_file
+
 if __name__ == '__main__':
 
     ############
@@ -1104,18 +1137,19 @@ if __name__ == '__main__':
     # check_file = text to be spell-checked
     dictionary_file, check_file = main(sys.argv[1:])
 
-    dict_valid = os.path.isfile(dictionary_file)
-    check_valid = os.path.isfile(check_file)
+    # Removed for AWS runs
+    # dict_valid = os.path.isfile(dictionary_file)
+    # check_valid = os.path.isfile(check_file)
 
-    if not dict_valid and not check_valid:
-        print 'Invalid dictionary and spellchecking files. Could not run.'
-        sys.exit()
-    elif not dict_valid:
-        print 'Invalid dictionary file. Could not run.'
-        sys.exit()
-    elif not check_valid:
-        print 'Invalid spellchecking file. Could not run.'
-        sys.exit()
+    # if not dict_valid and not check_valid:
+    #     print 'Invalid dictionary and spellchecking files. Could not run.'
+    #     sys.exit()
+    # elif not dict_valid:
+    #     print 'Invalid dictionary file. Could not run.'
+    #     sys.exit()
+    # elif not check_valid:
+    #     print 'Invalid spellchecking file. Could not run.'
+    #     sys.exit()
 
     ############
     #

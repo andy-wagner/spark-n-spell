@@ -11,7 +11,6 @@ import os
 from pyspark import SparkContext
 sc = SparkContext()
 sc.setLogLevel('ERROR')
-os.environ['PYSPARK_PYTHON']='/usr/bin/python2.7'
 
 ######################
 #
