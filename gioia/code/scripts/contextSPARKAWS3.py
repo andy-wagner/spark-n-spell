@@ -809,7 +809,7 @@ def get_count_mismatches(sentences):
 def correct_document_context_parallel_full(fname, dictionary,
                              start_prob, default_start_prob,
                              transition_prob, default_transition_prob,
-                             max_edit_distance=3, num_partitions=6,
+                             max_edit_distance=3, num_partitions=16,
                              display_results=False):
     
     '''
@@ -903,7 +903,7 @@ def correct_document_context_parallel_full(fname, dictionary,
 
     # start loop from second word (zero-indexed)
     word_num = 1
-    
+
     # extract any sentences that have been fully processed
     # RDD format: (sentence id, [([path], P(path)), ([path], P(path)), ...]), 
     #             (sentence id, [([path], P(path)), ([path], P(path)), ...]), ...
@@ -959,11 +959,12 @@ def correct_document_context_parallel_full(fname, dictionary,
         # RDD format: (sentence id, [([path], P(path)), ([path], P(path)), ...]), 
         #             (sentence id, [([path], P(path)), ([path], P(path)), ...]), ...
         # cache as this is carried over to the next iteration
+        # note: we confirmed that the RDDs being joined/unioned are
+        #  co-partitioned during the development phase
         completed = completed \
             .union(sentence_word_count.filter(lambda (k, v): v==word_num) \
             .join(sentence_path) \
-            .mapValues(lambda v: v[1])).partitionBy(num_partitions).cache()
-
+            .mapValues(lambda v: v[1])).cache()
        
         # filter for the next words in sentences
         # RDD format: (sentence id, (word, [suggestions for word])), 
@@ -974,13 +975,16 @@ def correct_document_context_parallel_full(fname, dictionary,
                 .mapValues(lambda v: (v[1], v[2])).cache()
 
     # this is necessary for stability - otherwise too many threads
-    # are spawned if we collect everything directly below.
-    completed.partitionBy(num_partitions).cache()
+    # are spawned if we collect everything directly below
+    completed.cache()
 
     # get most likely path (sentence)
     # RDD format: (sentence id, [suggested sentence]),
     #             (sentence id, [suggested sentence]), ...
     sentence_suggestion = completed.mapValues(lambda v: get_max_path(v))
+
+    # checks that RDDs are co-partitioned
+    # assert sentence_id.partitioner == sentence_suggestion.partitioner
 
     # join with original path (sentence)
     # RDD format: (sentence id, ([original sentence], [suggested sentence])),
@@ -1072,39 +1076,6 @@ def main(argv):
     '''
 
     # default values - use if not overridden
-    dictionary_file = 'testdata/big.txt'
-    check_file = 'testdata/yelp100reviews.txt'
-
-    # read in command line parameters (if any)
-    try:
-        opts, args = getopt.getopt(argv,'d:c:',['dfile=','cfile='])
-    except getopt.GetoptError:
-        print 'contextSerial.py -d <dfile> -c <cfile>'
-        print 'Default values will be applied.'
-
-    # parse command line parameters    
-    for opt, arg in opts:
-        if opt in ('-d', '--dictionary'):
-            dictionary_file = arg
-        elif opt in ('-c', '--cfile'):
-            check_file = arg
-
-    # return command line parameters (or default values if not provided)
-    return dictionary_file, check_file
-
-def main(argv):
-    '''
-    Parse command line parameters (if any).
-
-    Command line parameters are expected to take the form:
-    -d : dictionary file
-    -c : spell-checking file
-
-    Default values are applied where files are not provided.
-    https://docs.python.org/2/library/getopt.html
-    '''
-
-    # default values - use if not overridden
     dictionary_file = 's3n://spark-n-spell/big.txt'
     check_file = 's3n://spark-n-spell/yelp100reviews.txt'
 
@@ -1129,27 +1100,13 @@ if __name__ == '__main__':
 
     ############
     #
-    # get input files and check that they are valid
+    # get input files
     #
     ############
 
     # dictionary_file = used for pre-processing steps
     # check_file = text to be spell-checked
     dictionary_file, check_file = main(sys.argv[1:])
-
-    # Removed for AWS runs
-    # dict_valid = os.path.isfile(dictionary_file)
-    # check_valid = os.path.isfile(check_file)
-
-    # if not dict_valid and not check_valid:
-    #     print 'Invalid dictionary and spellchecking files. Could not run.'
-    #     sys.exit()
-    # elif not dict_valid:
-    #     print 'Invalid dictionary file. Could not run.'
-    #     sys.exit()
-    # elif not check_valid:
-    #     print 'Invalid spellchecking file. Could not run.'
-    #     sys.exit()
 
     ############
     #

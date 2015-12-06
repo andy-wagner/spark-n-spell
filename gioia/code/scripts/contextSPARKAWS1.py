@@ -34,7 +34,7 @@ sc.setLogLevel('ERROR')
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 3 Dec 2015
+# v 1.0 last revised 5 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition
@@ -55,6 +55,9 @@ sc.setLogLevel('ERROR')
 # All probabilities are stored in log-space to avoid underflow. Pre-
 # defined minimum values are used for words that are not present in
 # the dictionary and/or probability tables.
+#
+# The pre-processing steps are the same across all three SPARK
+# implementations.
 #
 # More detail on the specific implementation is included below.
 #
@@ -171,7 +174,7 @@ def map_transition_prob(vals):
     return {k: math.log(v/total) for k, v in vals.items()}
 
 def parallel_create_dictionary(fname, max_edit_distance=3, 
-                                num_partitions=256):
+                                num_partitions=64):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
@@ -201,9 +204,11 @@ def parallel_create_dictionary(fname, max_edit_distance=3,
     # split into individual sentences and remove other punctuation
     # RDD format: [words of sentence 1], [words of sentence 2], ...
     # cache because this RDD is used in multiple operations 
-    split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
-            .map(lambda sentence: regex.sub(' ', sentence)) \
-            .map(lambda sentence: sentence.split()).cache()
+    split_sentence = make_all_lower.flatMap(lambda 
+        line: line.replace('?','.').replace('!','.').split('.')) \
+             .map(lambda sentence: regex.sub(' ', sentence)) \
+             .map(lambda sentence: sentence.split()) \
+             .filter(lambda x: x!=[]).cache()
     
     ############
     #
@@ -830,7 +835,7 @@ def get_count_mismatches(sentences):
 def correct_document_context_parallel_naive(fname, dictionary,
                              start_prob, default_start_prob,
                              transition_prob, default_transition_prob,
-                             max_edit_distance=3, num_partitions=256,
+                             max_edit_distance=3, num_partitions=64,
                              display_results=False):
     
     '''
@@ -883,8 +888,9 @@ def correct_document_context_parallel_naive(fname, dictionary,
     # RDD format: (0, [words of sentence1]), (1, [words of sentence2]), ...
     # cache here after completing transformations - results in 
     # improvements in runtime that scale with file size
+    # partition as sentence id will remain the key going forward
     sentence_id = split_sentence.zipWithIndex().map(
-        lambda (k, v): (v, k)).cache()
+        lambda (k, v): (v, k)).partitionBy(num_partitions).cache()
 
     ############
     #
@@ -976,27 +982,13 @@ if __name__ == '__main__':
 
     ############
     #
-    # get input files and check that they are valid
+    # get input files
     #
     ############
 
     # dictionary_file = used for pre-processing steps
     # check_file = text to be spell-checked
     dictionary_file, check_file = main(sys.argv[1:])
-
-    # Removed for AWS runs
-    # dict_valid = os.path.isfile(dictionary_file)
-    # check_valid = os.path.isfile(check_file)
-
-    # if not dict_valid and not check_valid:
-    #     print 'Invalid dictionary and spellchecking files. Could not run.'
-    #     sys.exit()
-    # elif not dict_valid:
-    #     print 'Invalid dictionary file. Could not run.'
-    #     sys.exit()
-    # elif not check_valid:
-    #     print 'Invalid spellchecking file. Could not run.'
-    #     sys.exit()
 
     ############
     #
