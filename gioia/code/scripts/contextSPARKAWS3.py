@@ -179,7 +179,7 @@ def map_transition_prob(vals):
     return {k: math.log(v/total) for k, v in vals.items()}
 
 def parallel_create_dictionary(fname, max_edit_distance=3, 
-                                num_partitions=16):
+                                num_partitions=64):
     '''
     Load a text file and use it to create a dictionary and
     to calculate start probabilities and transition probabilities. 
@@ -809,7 +809,7 @@ def get_count_mismatches(sentences):
 def correct_document_context_parallel_full(fname, dictionary,
                              start_prob, default_start_prob,
                              transition_prob, default_transition_prob,
-                             max_edit_distance=3, num_partitions=16,
+                             max_edit_distance=3, num_partitions=64,
                              display_results=False):
     
     '''

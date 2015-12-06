@@ -872,12 +872,13 @@ def correct_document_context_parallel_naive(fname, dictionary,
             .filter(lambda x: x!='')
         
     # split into individual sentences and remove other punctuation
-    # RDD format: [words of sentence1], [words of sentence2], ...
+    # RDD format: [words of sentence 1], [words of sentence 2], ...
     # cache because this RDD is used in multiple operations 
-    split_sentence = make_all_lower.flatMap(lambda line: line.split('.')) \
-            .map(lambda sentence: regex.sub(' ', sentence)) \
-            .map(lambda sentence: sentence.split()) \
-            .filter(lambda x: x!=[]).cache()
+    split_sentence = make_all_lower.flatMap(lambda 
+        line: line.replace('?','.').replace('!','.').split('.')) \
+             .map(lambda sentence: regex.sub(' ', sentence)) \
+             .map(lambda sentence: sentence.split()) \
+             .filter(lambda x: x!=[]).cache()
     
     # use accumulator to count the number of words checked
     accum_total_words = sc.accumulator(0)
