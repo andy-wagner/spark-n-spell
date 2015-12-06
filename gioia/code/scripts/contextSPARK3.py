@@ -903,7 +903,7 @@ def correct_document_context_parallel_full(fname, dictionary,
 
     # start loop from second word (zero-indexed)
     word_num = 1
-    
+
     # extract any sentences that have been fully processed
     # RDD format: (sentence id, [([path], P(path)), ([path], P(path)), ...]), 
     #             (sentence id, [([path], P(path)), ([path], P(path)), ...]), ...
@@ -959,11 +959,12 @@ def correct_document_context_parallel_full(fname, dictionary,
         # RDD format: (sentence id, [([path], P(path)), ([path], P(path)), ...]), 
         #             (sentence id, [([path], P(path)), ([path], P(path)), ...]), ...
         # cache as this is carried over to the next iteration
+        # note: we confirmed that the RDDs being joined/unioned are
+        #  co-partitioned during the development phase
         completed = completed \
             .union(sentence_word_count.filter(lambda (k, v): v==word_num) \
             .join(sentence_path) \
-            .mapValues(lambda v: v[1])).partitionBy(num_partitions).cache()
-
+            .mapValues(lambda v: v[1])).cache()
        
         # filter for the next words in sentences
         # RDD format: (sentence id, (word, [suggestions for word])), 
@@ -974,13 +975,16 @@ def correct_document_context_parallel_full(fname, dictionary,
                 .mapValues(lambda v: (v[1], v[2])).cache()
 
     # this is necessary for stability - otherwise too many threads
-    # are spawned if we collect everything directly below.
-    completed.partitionBy(num_partitions).cache()
+    # are spawned if we collect everything directly below
+    completed.cache()
 
     # get most likely path (sentence)
     # RDD format: (sentence id, [suggested sentence]),
     #             (sentence id, [suggested sentence]), ...
     sentence_suggestion = completed.mapValues(lambda v: get_max_path(v))
+
+    # checks that RDDs are co-partitioned
+    # assert sentence_id.partitioner == sentence_suggestion.partitioner
 
     # join with original path (sentence)
     # RDD format: (sentence id, ([original sentence], [suggested sentence])),

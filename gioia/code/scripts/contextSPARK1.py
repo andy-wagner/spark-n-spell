@@ -888,6 +888,7 @@ def correct_document_context_parallel_naive(fname, dictionary,
     # RDD format: (0, [words of sentence1]), (1, [words of sentence2]), ...
     # cache here after completing transformations - results in 
     # improvements in runtime that scale with file size
+    # partition as sentence id will remain the key going forward
     sentence_id = split_sentence.zipWithIndex().map(
         lambda (k, v): (v, k)).partitionBy(num_partitions).cache()
 
