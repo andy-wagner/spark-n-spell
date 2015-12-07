@@ -34,7 +34,7 @@ sc.setLogLevel('ERROR')
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 5 Dec 2015
+# v 1.0 last revised 6 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition

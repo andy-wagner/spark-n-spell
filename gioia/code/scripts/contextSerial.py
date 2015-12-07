@@ -29,7 +29,7 @@ import os
 #
 # SUMMARY OF CONTEXT-LEVEL CORRECTION LOGIC - VITERBI ALGORITHM
 #
-# v 1.0 last revised 5 Dec 2015
+# v 1.0 last revised 6 Dec 2015
 #
 # Each sentence is modeled as a hidden Markov model. Prior
 # probabilities (for first words in the sentences) and transition
@@ -38,7 +38,7 @@ import os
 # probabilities are generated on the fly by parameterizing a Poisson 
 # distribution with the edit distance between words and suggested
 # corrections.
-
+#
 # The state space of possible corrections for each word is generated
 # using logic based on the Symspell spell-checker (see below for more
 # detail on Symspell). Valid suggestions must: (a) be 'real' words;
